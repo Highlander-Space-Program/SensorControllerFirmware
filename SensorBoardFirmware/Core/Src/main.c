@@ -31,7 +31,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define TX_ID 0x446
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -49,7 +49,8 @@ RTC_HandleTypeDef hrtc;
 SPI_HandleTypeDef hspi1;
 
 /* USER CODE BEGIN PV */
-
+uint8_t to_send[8];
+uint8_t to_send_size = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -60,7 +61,7 @@ static void MX_ADC_Init(void);
 static void MX_CAN_Init(void);
 static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
-
+void handle_CAN_RX_FIFO0_IRQ(CAN_HandleTypeDef *pcan);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -102,15 +103,53 @@ int main(void)
   MX_CAN_Init();
   MX_RTC_Init();
   /* USER CODE BEGIN 2 */
+  CAN_FilterTypeDef filter;
+  filter.FilterMaskIdHigh = 0x0;
+  filter.FilterMaskIdLow = 0x0;
+  filter.FilterMode = CAN_FILTERMODE_IDMASK;
+  filter.FilterBank = 0;
+  filter.FilterScale = CAN_FILTERSCALE_32BIT;
+  filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+  filter.FilterActivation = CAN_FILTER_ENABLE;
+  if (HAL_CAN_ConfigFilter(&hcan, &filter) != HAL_OK) {
+      Error_Handler();
+  }
+
+  if (HAL_CAN_RegisterCallback(&hcan, HAL_CAN_RX_FIFO0_MSG_PENDING_CB_ID, handle_CAN_RX_FIFO0_IRQ) != HAL_OK) {
+      Error_Handler();
+  }
+
+  if (HAL_CAN_Start(&hcan) != HAL_OK) {
+      Error_Handler();
+  }
+
+  if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
+      Error_Handler();
+  }
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  CAN_TxHeaderTypeDef tx_header;
+  tx_header.StdId = TX_ID;
+  tx_header.IDE = CAN_ID_STD;
+  tx_header.RTR = CAN_RTR_DATA;
+  tx_header.TransmitGlobalTime = DISABLE;
+  uint32_t tx_mailbox;
+
   while (1)
   {
-    /* USER CODE END WHILE */
+      if (to_send_size != 0) {
+          tx_header.DLC = to_send_size;
+          if (HAL_CAN_AddTxMessage(&hcan, &tx_header, to_send, &tx_mailbox) != HAL_OK) {
+              Error_Handler();
+          }
 
+          to_send_size = 0;
+      }
+
+    /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -358,7 +397,22 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void handle_CAN_RX_FIFO0_IRQ(CAN_HandleTypeDef *pcan) {
+    HAL_GPIO_WritePin(BUILTIN_LED_GPIO_Port, BUILTIN_LED_Pin, GPIO_PIN_SET);
 
+    CAN_RxHeaderTypeDef header;
+    uint8_t data[8];
+    if (HAL_CAN_GetRxMessage(pcan, CAN_RX_FIFO0, &header, data) != HAL_OK) {
+        Error_Handler();
+    }
+
+    for (int i=0; i<header.DLC; i++) {
+        to_send[i] = data[i];
+    }
+    to_send_size = header.DLC;
+
+    HAL_GPIO_WritePin(BUILTIN_LED_GPIO_Port, BUILTIN_LED_Pin, GPIO_PIN_RESET);
+}
 /* USER CODE END 4 */
 
 /**
@@ -369,9 +423,11 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
+//  __disable_irq();
   while (1)
   {
+      HAL_GPIO_TogglePin(BUILTIN_LED_GPIO_Port, BUILTIN_LED_Pin);
+      HAL_Delay(100);
   }
   /* USER CODE END Error_Handler_Debug */
 }
