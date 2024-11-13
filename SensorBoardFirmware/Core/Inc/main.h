@@ -36,7 +36,15 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
+typedef enum {
+    TS_ADC = 0,
+    TS_MCU
+} Temperature_Source;
 
+typedef struct {
+    Temperature_Source source;
+    float temperature;
+} Temperature_Packet;
 /* USER CODE END ET */
 
 /* Exported constants --------------------------------------------------------*/
@@ -53,7 +61,11 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+HAL_StatusTypeDef send_can_msg(const uint8_t *data, size_t len);
 
+float temperature_code_to_temperature(int16_t temperature_code);
+
+float to_pressure(int16_t adc_output);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

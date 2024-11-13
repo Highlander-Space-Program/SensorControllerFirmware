@@ -21,17 +21,32 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "ADS1118.h"
+#include "stm32f0xx_ll_adc.h"
 #include <memory.h>
+
+//#include "ADS1118.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct {
+  int16_t max_pressure;
+  int16_t min_pressure;
+  float max_voltage;
+  float min_voltage;
+  float conversion;
+} PT_Config;
+volatile PT_Config pt = {1000, 0, 4.5f, 0.5f};
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define TX_ID 0x446
+
+#define ENDPOINT_TEMPERATURE 15
+#define ENDPOINT_LED 23
+#define ENDPOINT_CALIBRATION 97
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -40,27 +55,33 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc;
+
 CAN_HandleTypeDef hcan;
 
 RTC_HandleTypeDef hrtc;
 
 SPI_HandleTypeDef hspi1;
+DMA_HandleTypeDef hdma_spi1_rx;
+DMA_HandleTypeDef hdma_spi1_tx;
 
 TIM_HandleTypeDef htim14;
 
 /* USER CODE BEGIN PV */
-volatile uint8_t to_send[8];
-volatile uint8_t to_send_size = 0;
-volatile uint8_t should_read_adc = 0;
+Ads1118TypeDef adc;
+volatile uint8_t start_read_adc = 0;
+volatile uint8_t adc_read_cplt = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_CAN_Init(void);
 static void MX_RTC_Init(void);
 static void MX_TIM14_Init(void);
+static void MX_ADC_Init(void);
 /* USER CODE BEGIN PFP */
 void handle_CAN_RX_FIFO0_IRQ(CAN_HandleTypeDef *pcan);
 /* USER CODE END PFP */
@@ -94,15 +115,16 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_SPI1_Init();
   MX_CAN_Init();
   MX_RTC_Init();
   MX_TIM14_Init();
+  MX_ADC_Init();
   /* USER CODE BEGIN 2 */
   CAN_FilterTypeDef filter;
   filter.FilterMaskIdHigh = 0x0;
@@ -116,63 +138,56 @@ int main(void)
       Error_Handler();
   }
 
-  if (HAL_CAN_RegisterCallback(&hcan, HAL_CAN_RX_FIFO0_MSG_PENDING_CB_ID, handle_CAN_RX_FIFO0_IRQ) != HAL_OK) {
-      Error_Handler();
-  }
+  if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING)) {
+    Error_Handler();
+  };
 
   if (HAL_CAN_Start(&hcan) != HAL_OK) {
       Error_Handler();
   }
 
-//  if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
-//      Error_Handler();
-//  }
+  // Configure ADC
+  adc.hspi = &hspi1;
+  adc.cs_gpio_port = ADC_CS_GPIO_Port;
+  adc.cs_pin = ADC_CS_Pin;
+  adc.config = (ADS1118_CONFIG_DEFAULT | (0b110 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS) | (0b001 << 9)) & 0xFBFF;
+  Ads1118_Configure(&adc);
 
+  // Start peripherals
+//  HAL_ADC_Start(&hadc);
+  HAL_TIM_Base_Start_IT(&htim14);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  CAN_TxHeaderTypeDef tx_header;
-  tx_header.StdId = TX_ID;
-  tx_header.IDE = CAN_ID_STD;
-  tx_header.RTR = CAN_RTR_DATA;
-  tx_header.TransmitGlobalTime = DISABLE;
-  uint32_t tx_mailbox;
+  int16_t buf[2] = { 0, 0 };
+  float res = 0.0f;
 
-  uint32_t adc_data = 0;
-  uint16_t adc_config = 0x058b | (0b100 << 12) | (1 << 15);
-
-  HAL_SPI_Transmit(&hspi1, (uint8_t*)&adc_config, 2, 1000);
-  memcpy((void*)to_send, &adc_config, sizeof(adc_config));
-  to_send_size = 2;
-  // Reset ADC SPI
-  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, GPIO_PIN_RESET);
-
-  HAL_TIM_Base_Start_IT(&htim14);
+  float v_div_ratio = 200.0f/275.0f;
 
   while (1)
   {
-      if (to_send_size != 0) {
-          tx_header.DLC = to_send_size;
-          if (HAL_CAN_AddTxMessage(&hcan, &tx_header, (const uint8_t *) to_send, &tx_mailbox) != HAL_OK) {
-              Error_Handler();
-          }
+      if (adc_read_cplt && (!HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_6))) {
+    	  // Update ADC config readback
+    	  adc.config_readback = buf[1];
 
-          to_send_size = 0;
+    	  // Send measurement over CAN
+          res = (4.096f/(0x3FFF))*(float)buf[0]; // Convert from ADC output to voltage
+          res /= v_div_ratio; // Compensate for voltage divider
+          res = (res - pt.min_voltage) * (float)(pt.max_pressure - pt.min_pressure) / (pt.max_voltage - pt.min_voltage); // Convert to pressure
+          send_can_msg((uint8_t*)(&res), sizeof(res));
+
+          adc_read_cplt = 0;
       }
 
-      if (should_read_adc && (!HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_6))) {
-          uint32_t adc_out = adc_config & (adc_config << 16);
-          if (HAL_SPI_TransmitReceive(&hspi1, (uint8_t*)&adc_out, (uint8_t*)&adc_data, 4, 1000) != HAL_OK) {
-              Error_Handler();
-          }
-          memcpy(to_send, &adc_data, sizeof(adc_data));
-          to_send_size = 2;
+      if (start_read_adc) {
+    	  // Start new single shot
+        if (Ads1118_Transmit(&adc, (uint32_t*)&buf) != HAL_OK) {
+          Error_Handler();
+        }
 
-          should_read_adc = 0;
+         start_read_adc = 0;
       }
-
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -193,8 +208,11 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI14|RCC_OSCILLATORTYPE_LSI
+                              |RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSI14State = RCC_HSI14_ON;
+  RCC_OscInitStruct.HSI14CalibrationValue = 16;
   RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
@@ -223,6 +241,60 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC_Init(void)
+{
+
+  /* USER CODE BEGIN ADC_Init 0 */
+
+  /* USER CODE END ADC_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC_Init 1 */
+
+  /* USER CODE END ADC_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc.Instance = ADC1;
+  hadc.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc.Init.ScanConvMode = ADC_SCAN_DIRECTION_FORWARD;
+  hadc.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc.Init.LowPowerAutoWait = DISABLE;
+  hadc.Init.LowPowerAutoPowerOff = DISABLE;
+  hadc.Init.ContinuousConvMode = ENABLE;
+  hadc.Init.DiscontinuousConvMode = DISABLE;
+  hadc.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc.Init.DMAContinuousRequests = DISABLE;
+  hadc.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  if (HAL_ADC_Init(&hadc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel to be converted.
+  */
+  sConfig.Channel = ADC_CHANNEL_TEMPSENSOR;
+  sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+  if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC_Init 2 */
+
+  /* USER CODE END ADC_Init 2 */
+
 }
 
 /**
@@ -326,7 +398,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi1.Init.CRCPolynomial = 7;
   hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
   if (HAL_SPI_Init(&hspi1) != HAL_OK)
   {
     Error_Handler();
@@ -353,7 +425,7 @@ static void MX_TIM14_Init(void)
 
   /* USER CODE END TIM14_Init 1 */
   htim14.Instance = TIM14;
-  htim14.Init.Prescaler = 0;
+  htim14.Init.Prescaler = 100;
   htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim14.Init.Period = 47999;
   htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -365,6 +437,22 @@ static void MX_TIM14_Init(void)
   /* USER CODE BEGIN TIM14_Init 2 */
 
   /* USER CODE END TIM14_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel2_3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel2_3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel2_3_IRQn);
 
 }
 
@@ -409,20 +497,77 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void handle_CAN_RX_FIFO0_IRQ(CAN_HandleTypeDef *pcan) {
+float temperature_code_to_temperature(int16_t temperature_code) {
+    if (temperature_code & (1 << 14)) {
+        temperature_code -= 1;
+        temperature_code = ~temperature_code;
+    }
+    return temperature_code * 0.03125f;
+}
+
+HAL_StatusTypeDef send_can_msg(const uint8_t *data, size_t len) {
+    CAN_TxHeaderTypeDef header;
+    header.IDE = CAN_ID_STD;
+    header.StdId = TX_ID;
+    header.RTR = CAN_RTR_DATA;
+    header.TransmitGlobalTime = DISABLE;
+    header.DLC = len;
+
+    uint32_t mailbox;
+
+    return HAL_CAN_AddTxMessage(&hcan, &header, data, &mailbox);
+}
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
     CAN_RxHeaderTypeDef header;
     uint8_t data[8];
-    if (HAL_CAN_GetRxMessage(pcan, CAN_RX_FIFO0, &header, data) != HAL_OK) {
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &header, data) != HAL_OK) {
         Error_Handler();
     }
 
+    uint8_t msg_type = data[0];
+    switch(msg_type) {
+      case ENDPOINT_CALIBRATION: {
+        if (header.DLC == 0) {
+          // Query
+          uint16_t response[] = {pt.max_pressure, pt.min_pressure}; //TODO extended frame with voltages
+          send_can_msg((uint8_t*)response, 4);
+        } else {
+          // Command
+          int16_t max = (int16_t)(data[1] | (data[2]<<8));
+          int16_t min = (int16_t)(data[3] | (data[4]<<8));
+          pt.max_pressure = max;
+          pt.min_pressure = min;
+        }
+      } break;
 
+      case ENDPOINT_LED: {
+        HAL_GPIO_TogglePin(BUILTIN_LED_GPIO_Port, BUILTIN_LED_Pin);
+      } break;
+    }
+}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
+	adc_read_cplt = 1;
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-    if (htim == &htim14) {
-        should_read_adc = 1;
-    }
+  start_read_adc = 1;
+//    should_read_adc = 1;
+
+//    float out[2];
+//    uint32_t buf;
+
+//    buf = HAL_ADC_GetValue(&hadc);
+//    out[TS_MCU] = __LL_ADC_CALC_TEMPERATURE(3300, buf, LL_ADC_RESOLUTION_12B);
+
+//  uint16_t adc_config = ADS1118_CONFIG_DEFAULT | (0b100 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS);
+//    if (Ads1118_Transmit(&adc_config, &hspi1, &buf, 1000) != HAL_OK) {
+//        Error_Handler();
+//    }
+//    out[TS_ADC] = temperature_code_to_temperature(buf);
+
+//    send_can_msg((uint8_t*)(&buf), 4);
 }
 /* USER CODE END 4 */
 
@@ -438,7 +583,7 @@ void Error_Handler(void)
   while (1)
   {
       HAL_GPIO_TogglePin(BUILTIN_LED_GPIO_Port, BUILTIN_LED_Pin);
-      HAL_Delay(100);
+      HAL_Delay(1000);
   }
   /* USER CODE END Error_Handler_Debug */
 }
