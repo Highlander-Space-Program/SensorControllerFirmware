@@ -167,6 +167,7 @@ int main(void)
 
   while (1)
   {
+    cout << "Hello" << endl;
       if (adc_read_cplt && (!HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_6))) {
     	  // Update ADC config readback
     	  adc.config_readback = buf[1];
