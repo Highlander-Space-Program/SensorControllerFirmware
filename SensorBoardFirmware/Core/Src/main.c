@@ -147,11 +147,13 @@ int main(void)
   }
 
   // Configure ADC
+  uint16_t portA_Config = (ADS1118_CONFIG_DEFAULT | (0b111 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS) | (0b001 << 9)) & 0xFBFF;
+  uint16_t portB_Config = (ADS1118_CONFIG_DEFAULT | (0b101 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS) | (0b001 << 9)) & 0xFBFF;
+
   adc.hspi = &hspi1;
   adc.cs_gpio_port = ADC_CS_GPIO_Port;
   adc.cs_pin = ADC_CS_Pin;
-  adc.config = (ADS1118_CONFIG_DEFAULT | (0b110 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS) | (0b001 << 9)) & 0xFBFF;
-  Ads1118_Configure(&adc);
+  adc.config = portA_Config;
 
   // Start peripherals
 //  HAL_ADC_Start(&hadc);
