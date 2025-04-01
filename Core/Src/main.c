@@ -39,7 +39,7 @@ volatile PT_Config pt = {1000, 0, 4.5f, 0.5f};
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define TX_ID 0x444
+#define TX_ID 0x110
 
 #define ENDPOINT_TEMPERATURE 15
 #define ENDPOINT_LED 23
@@ -117,7 +117,8 @@ int main(void)
   MX_TIM14_Init();
   /* USER CODE BEGIN 2 */
   CAN_FilterTypeDef filter;
-  filter.FilterMaskIdHigh = 0x0;
+  filter.FilterIdHigh = 0x110 << 5;
+  filter.FilterMaskIdHigh = 0x110 << 5;
   filter.FilterMaskIdLow = 0x0;
   filter.FilterMode = CAN_FILTERMODE_IDMASK;
   filter.FilterBank = 0;
@@ -137,10 +138,12 @@ int main(void)
   }
 
   // Configure ADC
+  uint16_t port_a_config = (ADS1118_CONFIG_DEFAULT | (0b111 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS) | (0b000 << 9)) & 0xFBFF;
+  uint16_t port_b_config = (ADS1118_CONFIG_DEFAULT | (0b101 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS) | (0b000 << 9)) & 0xFBFF;
   adc.hspi = &hspi1;
   adc.cs_gpio_port = ADC_CS_GPIO_Port;
   adc.cs_pin = ADC_CS_Pin;
-  adc.config = (ADS1118_CONFIG_DEFAULT | (0b111 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS) | (0b000 << 9)) & 0xFBFF;
+  adc.config = port_a_config;
   Ads1118_Configure(&adc);
 
   // Start peripherals
@@ -414,6 +417,7 @@ HAL_StatusTypeDef send_can_msg(const uint8_t *data, size_t len) {
 }
 
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+	HAL_GPIO_TogglePin(WARN_IND_GPIO_Port, WARN_IND_Pin);
     CAN_RxHeaderTypeDef header;
     uint8_t data[8];
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &header, data) != HAL_OK) {
