@@ -23,18 +23,16 @@
 /* USER CODE BEGIN Includes */
 #include "ADS1118.h"
 #include <memory.h>
+#include "config/config.h"
+#include "config/pt_config.h"
+#include "utils/board_utils.h"
+#include "utils/can_utils.h"
+#include "stdbool.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-typedef struct {
-  int16_t max_pressure;
-  int16_t min_pressure;
-  float max_voltage;
-  float min_voltage;
-  float conversion;
-} PT_Config;
-volatile PT_Config pt = {1000, 0, 4.5f, 0.5f};
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -58,12 +56,19 @@ SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef hdma_spi1_rx;
 DMA_HandleTypeDef hdma_spi1_tx;
 
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim14;
 
 /* USER CODE BEGIN PV */
+PtConfig* PT_A = NULL;
+PtConfig* PT_B = NULL;
 Ads1118TypeDef adc;
 volatile uint8_t start_read_adc = 0;
 volatile uint8_t adc_read_cplt = 0;
+uint32_t board_id[3];
+static uint8_t short_board_id;
+bool flash_signal_cmd = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -73,8 +78,10 @@ static void MX_DMA_Init(void);
 static void MX_CAN_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM14_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
-
+uint32_t frequency_to_period_ms(uint32_t frequency);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -115,27 +122,52 @@ int main(void)
   MX_CAN_Init();
   MX_SPI1_Init();
   MX_TIM14_Init();
+  MX_TIM2_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  CAN_FilterTypeDef filter;
-  filter.FilterIdHigh = 0x110 << 5;
-  filter.FilterMaskIdHigh = 0x110 << 5;
-  filter.FilterMaskIdLow = 0x0;
-  filter.FilterMode = CAN_FILTERMODE_IDMASK;
-  filter.FilterBank = 0;
-  filter.FilterScale = CAN_FILTERSCALE_32BIT;
-  filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
-  filter.FilterActivation = CAN_FILTER_ENABLE;
-  if (HAL_CAN_ConfigFilter(&hcan, &filter) != HAL_OK) {
-      Error_Handler();
-  }
+  GET_BOARD_UID(board_id);
+  short_board_id = GET_SHORT_BOARD_ID(board_id);
+  // Configure filter for extended ID
+    CAN_FilterTypeDef filter;
+    filter.FilterActivation = CAN_FILTER_ENABLE;
+    filter.FilterBank = 0;
+    filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+    filter.FilterMode = CAN_FILTERMODE_IDMASK;
+    filter.FilterScale = CAN_FILTERSCALE_32BIT;
 
-  if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING)) {
-    Error_Handler();
-  };
+    // Page 1091 in STM32F405 Reference Manual
+    // first 29 are the identifier, then IDE, then RTR, then 0
 
-  if (HAL_CAN_Start(&hcan) != HAL_OK) {
+    // we only care about the 8 bits to make sure that its talking to the right board, so we use that
+    uint32_t canIdFilter = (short_board_id << 16);
+    uint32_t canIdMask = 0x00FF0000;
+
+    // Set IDE bit in both filter and mask
+    canIdFilter |= CAN_ID_EXT;
+    canIdFilter |= CAN_RTR_DATA;
+    canIdMask |= CAN_ID_EXT;
+    canIdMask |= CAN_RTR_DATA;
+
+    filter.FilterIdHigh = (canIdFilter >> 16) & 0xFFFF;
+    filter.FilterIdLow = canIdFilter & 0xFFFF;
+    filter.FilterMaskIdHigh = (canIdMask >> 16) & 0xFFFF;
+    filter.FilterMaskIdLow = canIdMask & 0xFFFF;
+
+    if (HAL_CAN_ConfigFilter(&hcan, &filter) != HAL_OK) {
+        Error_Handler();
+    }
+
+    if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING)) {
       Error_Handler();
-  }
+    };
+
+    if (HAL_CAN_Start(&hcan) != HAL_OK) {
+        Error_Handler();
+    }
+
+    STATUS_IND_Toggle();
+    HAL_Delay(500);
+    STATUS_IND_Toggle();
 
   // Configure ADC
   uint16_t port_a_config = (ADS1118_CONFIG_DEFAULT | (0b111 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS) | (0b000 << 9)) & 0xFBFF;
@@ -146,9 +178,52 @@ int main(void)
   adc.config = port_a_config;
   Ads1118_Configure(&adc);
 
+//  get both pt can ids
+  uint32_t pt_1_can_id = GET_PT_CAN_ID(board_id, 1);
+  uint32_t pt_2_can_id = GET_PT_CAN_ID(board_id, 2);
+
+  htim2.Init.Period = 0;
+  htim3.Init.Period = 0;
+
+  if (pt_1_can_id != -1) {
+//	  set pt_1 to either A or B based on its config
+	  PtConfig* tempPtConfig = GET_PT_CONFIG(pt_1_can_id);
+	  if (tempPtConfig->port == 'A') {
+		  PT_A = tempPtConfig;
+		  htim2.Init.Period = frequency_to_period_ms(PT_A->frequency);
+	  }
+	  else if (tempPtConfig->port == 'B') {
+		  PT_B = tempPtConfig;
+		  htim3.Init.Period = frequency_to_period_ms(PT_B->frequency);
+	  }
+  }
+
+  if (pt_2_can_id != -1) {
+//	  set pt_2 to either A or B based on its config
+	  PtConfig* tempPtConfig = GET_PT_CONFIG(pt_2_can_id);
+	  if (tempPtConfig->port == 'A') {
+		  PT_A = tempPtConfig;
+		  htim2.Init.Period = frequency_to_period_ms(PT_A->frequency);
+	  }
+	  else if (tempPtConfig->port == 'B') {
+		  PT_B = tempPtConfig;
+		  htim3.Init.Period = frequency_to_period_ms(PT_B->frequency);
+	  }
+  }
   // Start peripherals
 //  HAL_ADC_Start(&hadc);
   HAL_TIM_Base_Start_IT(&htim14);
+
+//  set timer 2 to interrupt at PT_A frequency
+  if (htim2.Init.Period != 0) {
+	  HAL_TIM_Base_Init(&htim2);
+	  HAL_TIM_Base_Start_IT(&htim2);
+  }
+//  set timer 3 to interrupt at PT_B frequency
+  if (htim3.Init.Period != 0) {
+  	  HAL_TIM_Base_Init(&htim3);
+  	  HAL_TIM_Base_Start_IT(&htim3);
+    }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -159,28 +234,30 @@ int main(void)
 
   while (1)
   {
-      if (adc_read_cplt && (!HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4))) {
-    	  // Update ADC config readback
-    	  adc.config_readback = buf[1];
+//      if (adc_read_cplt && (!HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4))) {
+//    	  // Update ADC config readback
+//    	  adc.config_readback = buf[1];
+//
+//    	  // Send measurement over CAN
+//          res = (v_fs/(0x7FFF))*(float)buf[0]; // Convert from ADC output to voltage
+//          res = 251.493315f * res - 122.744008;
+//          send_can_msg((uint8_t*)(&res), sizeof(res));
+//
+//          adc_read_cplt = 0;
+//      }
+//
+//      if (start_read_adc) {
+//    	  // Start new single shot
+//        if (Ads1118_Transmit(&adc, (uint32_t*)&buf) != HAL_OK) {
+//          Error_Handler();
+//        }
+//
+//         start_read_adc = 0;
+//      }
 
-    	  // Send measurement over CAN
-          res = (v_fs/(0x7FFF))*(float)buf[0]; // Convert from ADC output to voltage
-          res = 251.493315f * res - 122.744008;
-//          res = (res - pt.min_voltage) * (pt.max_pressure - pt.min_pressure) / (pt.max_voltage - pt.min_voltage); // Convert to pressure
-//          res = 100 * res / (0.002 * 5); // Convert to kg
-          send_can_msg((uint8_t*)(&res), sizeof(res));
-
-          adc_read_cplt = 0;
-      }
-
-      if (start_read_adc) {
-    	  // Start new single shot
-        if (Ads1118_Transmit(&adc, (uint32_t*)&buf) != HAL_OK) {
-          Error_Handler();
-        }
-
-         start_read_adc = 0;
-      }
+	  if (flash_signal_cmd) {
+		  flash_signal_cmd = Tick_SIGNAL(flash_signal_cmd);
+	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -303,6 +380,96 @@ static void MX_SPI1_Init(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 63999;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 0;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 63999;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 0;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
   * @brief TIM14 Initialization Function
   * @param None
   * @retval None
@@ -398,75 +565,98 @@ float temperature_code_to_temperature(int16_t temperature_code) {
     return temperature_code * 0.03125f;
 }
 
-HAL_StatusTypeDef send_can_msg(const uint8_t *data, size_t len) {
-    CAN_TxHeaderTypeDef header;
-    header.IDE = CAN_ID_STD;
-    header.StdId = TX_ID;
-    header.RTR = CAN_RTR_DATA;
-    header.TransmitGlobalTime = DISABLE;
-    header.DLC = len;
-
-    uint32_t mailbox;
-
-    HAL_StatusTypeDef status = HAL_CAN_AddTxMessage(&hcan, &header, data, &mailbox);
-    if (status != HAL_OK) {
-
-    }
-
-    return status;
-}
-
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
-	HAL_GPIO_TogglePin(WARN_IND_GPIO_Port, WARN_IND_Pin);
-    CAN_RxHeaderTypeDef header;
-    uint8_t data[8];
-    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &header, data) != HAL_OK) {
-        Error_Handler();
-    }
-
-    uint8_t msg_type = data[0];
-    switch(msg_type) {
-      case ENDPOINT_CALIBRATION: {
-        if (header.DLC == 0) {
-          // Query
-          uint16_t response[] = {pt.max_pressure, pt.min_pressure}; //TODO extended frame with voltages
-          send_can_msg((uint8_t*)response, 4);
-        } else {
-          // Command
-          int16_t max = (int16_t)(data[1] | (data[2]<<8));
-          int16_t min = (int16_t)(data[3] | (data[4]<<8));
-          pt.max_pressure = max;
-          pt.min_pressure = min;
-        }
-      } break;
-
-      case ENDPOINT_LED: {
-        HAL_GPIO_TogglePin(STATUS_IND_GPIO_Port, STATUS_IND_Pin);
-      } break;
-    }
-}
+//HAL_StatusTypeDef send_can_msg(const uint8_t *data, size_t len) {
+//    CAN_TxHeaderTypeDef header;
+//    header.IDE = CAN_ID_STD;
+//    header.StdId = TX_ID;
+//    header.RTR = CAN_RTR_DATA;
+//    header.TransmitGlobalTime = DISABLE;
+//    header.DLC = len;
+//
+//    uint32_t mailbox;
+//
+//    HAL_StatusTypeDef status = HAL_CAN_AddTxMessage(&hcan, &header, data, &mailbox);
+//    if (status != HAL_OK) {
+//
+//    }
+//
+//    return status;
+//}
 
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
 	adc_read_cplt = 1;
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-  start_read_adc = 1;
-//    should_read_adc = 1;
 
-//    float out[2];
-//    uint32_t buf;
+	if (htim->Instance == TIM14) {
+		start_read_adc = 1;
+		//    should_read_adc = 1;
 
-//    buf = HAL_ADC_GetValue(&hadc);
-//    out[TS_MCU] = __LL_ADC_CALC_TEMPERATURE(3300, buf, LL_ADC_RESOLUTION_12B);
+		//    float out[2];
+		//    uint32_t buf;
 
-//  uint16_t adc_config = ADS1118_CONFIG_DEFAULT | (0b100 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS);
-//    if (Ads1118_Transmit(&adc_config, &hspi1, &buf, 1000) != HAL_OK) {
-//        Error_Handler();
-//    }
-//    out[TS_ADC] = temperature_code_to_temperature(buf);
+		//    buf = HAL_ADC_GetValue(&hadc);
+		//    out[TS_MCU] = __LL_ADC_CALC_TEMPERATURE(3300, buf, LL_ADC_RESOLUTION_12B);
 
-//    send_can_msg((uint8_t*)(&buf), 4);
+		//  uint16_t adc_config = ADS1118_CONFIG_DEFAULT | (0b100 << ADS1118_CONFIG_BIT_MUX) | (1 << ADS1118_CONFIG_BIT_SS);
+		//    if (Ads1118_Transmit(&adc_config, &hspi1, &buf, 1000) != HAL_OK) {
+		//        Error_Handler();
+		//    }
+		//    out[TS_ADC] = temperature_code_to_temperature(buf);
+
+		//    send_can_msg((uint8_t*)(&buf), 4);
+	}
+	if (htim->Instance == TIM2) {
+//		Handle PT_A timer interrupt
+		volatile uint32_t ticks = HAL_GetTick();
+		STATUS_IND_Toggle();
+	}
+	if (htim->Instance == TIM3) {
+//		Handle PT_B timer interrupt
+		volatile uint32_t ticks = HAL_GetTick();
+		STATUS_IND_Toggle();
+	}
+
+}
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+//	STATUS_IND_Toggle();
+    CAN_RxHeaderTypeDef RxHeader;
+    uint8_t RxData[8];  // Max CAN data length = 8 bytes
+
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    // Parse extended ID to extract fields
+    uint8_t sender, board_id, msg_type, instance;
+    parse_can_extended_id(RxHeader.ExtId, &sender, &board_id, &msg_type, &instance);
+
+    // Check if message is intended for this board
+    if (board_id == short_board_id) {
+        // Set command based on component type
+        switch (msg_type) {
+
+            case MSG_TYPE_LED:
+                // Toggle status LED for feedback
+                STATUS_IND_Toggle();
+                break;
+
+            case MSG_TYPE_FLASH_SIGNAL:
+            	flash_signal_cmd = 1;
+            	break;
+            default:
+                // Unknown component type
+                break;
+        }
+    }
+}
+
+uint32_t frequency_to_period_ms(uint32_t frequency) {
+	return (uint32_t)((1.0f / frequency) * 1000);
 }
 /* USER CODE END 4 */
 

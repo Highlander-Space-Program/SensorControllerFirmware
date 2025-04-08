@@ -61,7 +61,6 @@ typedef struct {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-HAL_StatusTypeDef send_can_msg(const uint8_t *data, size_t len);
 
 float temperature_code_to_temperature(int16_t temperature_code);
 
